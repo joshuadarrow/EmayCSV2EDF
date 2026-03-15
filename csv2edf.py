@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
 
+# todo:
+# 1) Enable more file types (EDF, EDF+, BDF, BDF+)
+# 2) Add cmdline argument capabilities (new filename)
+# 3) More flexible timestamp column options + make this available via cmdline
+
 import pandas as pd
 import numpy as np
 import pyedflib
