@@ -4,124 +4,90 @@ import pandas as pd
 import numpy as np
 import pyedflib
 import re
+import sys
+import os
 from datetime import datetime
 
-# ---------------------------
-# USER OPTIONS
-# ---------------------------
-INPUT_CSV = "/home/joshua/Documents/Medical/Data/SpO2/JoshuaDarrow/2026/csv/EMAY_SpO2_20260215_025349.csv"
-OUTPUT_EDF = "output.edf"
-AUTO_SAMPLE_RATE = True   # If False, use MANUAL_SAMPLE_RATE
-MANUAL_SAMPLE_RATE = 1
-NAN = -999
-# ---------------------------
-
-
 def extract_unit(column_name):
-    """Extract unit from header like 'SpO2(%)' -> '%' """
     match = re.search(r"\((.*?)\)", column_name)
     return match.group(1) if match else ""
 
-
 def clean_label(column_name):
-    """Remove unit part from label"""
     return re.sub(r"\(.*?\)", "", column_name).strip()
 
-def convert_times(df):
-    '''convert Date + time columns to datetime object timestamps'''
-    df["datetime"] = pd.to_datetime(df["Date"] + " " + df["Time"])
-    df.drop(['Date', 'Time'], axis=1, inplace=True)
-
-def calc_sample_rate(df):
-    '''get the sample rate from the elapsed time between first two data points'''
-    dt = df["datetime"].iloc[1] - df["datetime"].iloc[0] 
-    return 1 / dt.total_seconds()
-
-def fill_nans(df, nan=0):
-    '''add rows of Nans for missing values to maintain constant sample rate'''
-    df["dt"] = (df["datetime"].shift(-1) - df["datetime"])- pd.Timedelta(seconds=1)
-
-    # create dataframe of Nan values to fill in missing observations
-    nans = pd.DataFrame(columns=df.columns.difference(["dt"])) 
-
-    for index, row in df.iloc[:-1].iterrows():
-        for i in range(1, int(row["dt"].total_seconds()+1)):
-            new_row = {col: nan for col in nans.columns}
-            new_row["datetime"] = row["datetime"] + pd.Timedelta(seconds=i)
-            nans.loc[len(nans)] = new_row
-
-    df.drop(["dt"], axis=1, inplace=True)
-    print(len(nans), "Nan observations created to maintain constant sample rate.")
-
-    # concatenate two datasets and sort to maintain proper ordering
-    df = pd.concat([df, nans])
-    df = df.sort_values(by="datetime")
-    print(df)
+def process_csv(input_path):
+    # 1. Load Data
+    df = pd.read_csv(input_path)
     
-    return 0
+    # 2. Handle Time/Date
+    # Convert to a single datetime index
+    df["datetime"] = pd.to_datetime(df["Date"] + " " + df["Time"])
+    df = df.sort_values(by="datetime").drop_duplicates(subset="datetime")
+    start_time = df["datetime"].iloc[0]
 
+    # 3. Calculate Sample Rate & Resample
+    # Instead of a manual loop, we use resample() which is much faster.
+    # It automatically inserts NaNs for missing seconds.
+    df = df.set_index("datetime")
+    # Drop original Date/Time strings so they don't break the numeric resampling
+    df = df.drop(columns=["Date", "Time"], errors='ignore')
+    
+    # Resample to 1-second intervals (adjust '1S' if your rate is different)
+    df = df.resample('1s').asfreq()
+    
+    # Fill NaNs with your designated placeholder
+    df = df.fillna(0) 
+#    print(df)
+#    df.to_csv(os.path.splitext(input_path)[0] + "_v2.csv")
 
-# 1️⃣ Load CSV
-df = pd.read_csv(INPUT_CSV)
+    sample_rate = 1.0 # Standard for most EMAY CSVs (1 sample per second)
+    
+    # 4. Write EDF+
+    output_edf = os.path.splitext(input_path)[0] + ".edf"
+    n_channels = len(df.columns)
+    
+    print(output_edf)
+    print(n_channels)
+    
+    writer = pyedflib.EdfWriter(
+        output_edf, 
+        n_channels=n_channels, 
+        file_type=pyedflib.FILETYPE_EDF#PLUS
+    )
+    
+#    writer.setDatarecordDuration(60) # 10 seconds per record block
+    
+    channel_info = []
+    signals = []
 
-convert_times(df)
-sample_rate = calc_sample_rate(df)
-fill_nans(df)
-print(df)
-print(sample_rate)
-exit(0)
+    for col in df.columns:
+        signal_data = df[col].values
+        unit = extract_unit(col)
+        label = clean_label(col)
 
+        channel_info.append({
+            "label": label[:16], # EDF labels are limited to 16 chars
+            "dimension": unit,
+            "sample_frequency": sample_rate,
+            "physical_min": float(np.min(signal_data)),
+            "physical_max": float(np.max(signal_data)) if np.max(signal_data) > np.min(signal_data) else float(np.min(signal_data) + 1),
+            "digital_min": -32768,
+            "digital_max": 32767,
+            "transducer": "EMAY Device",
+            "prefilter": ""
+        })
+        signals.append(signal_data)
 
+    writer.setSignalHeaders(channel_info)
+    writer.setStartdatetime(start_time)
+    writer.writeSamples(signals)
+    writer.close()
 
+    print(f"Successfully converted {input_path} to {output_edf}")
+    print(f"Start Time: {start_time} | Samples: {len(df)}")
 
-
-# Calculate sample rate
-# Fill in missing or Nan values with -999
-# extract SpO2 and PR columns
-# write to edf+ format
-
-
-
-
-# 4️⃣ Replace NaNs with 0
-df = df.fill_null(0)
-
-# 5️⃣ Convert signal data
-data_np = df.to_numpy().T
-n_channels, n_samples = data_np.shape
-
-# 6️⃣ Build channel headers dynamically
-channel_info = []
-
-for i, col in enumerate(df.columns):
-    signal = data_np[i]
-    unit = extract_unit(col)
-    label = clean_label(col)
-
-    channel_info.append({
-        "label": label,
-        "dimension": unit,
-        "sample_rate": sample_rate,
-        "physical_min": float(signal.min()),
-        "physical_max": float(signal.max()),
-        "digital_min": -32768,
-        "digital_max": 32767,
-        "transducer": "",
-        "prefilter": ""
-    })
-
-
-# 7️⃣ Write EDF+
-writer = pyedflib.EdfWriter(
-    OUTPUT_EDF,
-    n_channels=n_channels,
-    file_type=pyedflib.FILETYPE_EDFPLUS
-)
-
-writer.setSignalHeaders(channel_info)
-writer.writeSamples(data_np)
-writer.close()
-
-print("Done.")
-print(f"Detected sample rate: {sample_rate} Hz")
-print("NaNs automatically replaced with 0.")
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print("Usage: ./script.py <filename.csv>")
+    else:
+        process_csv(sys.argv[1])
